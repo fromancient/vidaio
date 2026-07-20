@@ -62,7 +62,22 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# libvmaf-enabled static ffmpeg used only for local VMAF / score search.
+COPY bin/ffmpeg-vmaf /usr/local/bin/ffmpeg-vmaf
+RUN chmod +x /usr/local/bin/ffmpeg-vmaf
+
+COPY score_sim.py vmaf_local.py adaptive.py zones.py perf_db.py vbr_plan.py integrity.py deadline_controller.py source_features.py rd_predictor.py app.py ./
+
+ENV FFMPEG_VMAF_BIN=/usr/local/bin/ffmpeg-vmaf
+ENV FAST_RD_MODE=true
+ENV ADAPTIVE_FULL_SEARCH=false
+ENV FAST_ENCODE_TIMEOUT_SECONDS=28
+ENV FAST_SVT_PRESET=8
+ENV FAST_X265_PRESET=veryfast
+ENV MAX_CONCURRENT_COMPRESSION=5
+ENV ADAPTIVE_COMPRESSION=false
+ENV ADAPTIVE_SVT_PRESET=8
+ENV ADAPTIVE_X265_PRESET=veryfast
 
 EXPOSE 8004
 CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8004"]

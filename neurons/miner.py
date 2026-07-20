@@ -13,6 +13,7 @@ import boto3
 import httpx
 import bittensor as bt
 from botocore.config import Config as BotoConfig
+from boto3.s3.transfer import TransferConfig
 from dotenv import load_dotenv
 from loguru import logger
 from vidaio_subnet_core.base.miner import BaseMiner
@@ -36,9 +37,56 @@ from vidaio_subnet_core.utilities.version import check_version
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / "miner" / ".env", override=False)
 
-MAX_CONTENT_LEN = ContentLength.FIVE
-warrant_task = TaskType.UPSCALING
+def _resolve_max_content_length() -> ContentLength:
+    # Prefer reliability-calibrated recommendation when present.
+    state_path = Path(
+        os.getenv("UPSCALE_LENGTH_STATE", "/tmp/vidaio-miner-video-tmp/upscale_length_state.json")
+    )
+    try:
+        if state_path.exists():
+            import json
+
+            recommended = int(json.loads(state_path.read_text(encoding="utf-8")).get("recommended") or 0)
+            if recommended in (5, 10):
+                return ContentLength.FIVE if recommended == 5 else ContentLength.TEN
+    except Exception:
+        pass
+
+    raw = os.getenv("MINER_MAX_CONTENT_LENGTH", "10").strip().lower()
+    aliases = {
+        "5": ContentLength.FIVE,
+        "five": ContentLength.FIVE,
+        "10": ContentLength.TEN,
+        "ten": ContentLength.TEN,
+    }
+    if raw not in aliases:
+        raise ValueError(
+            f"Invalid MINER_MAX_CONTENT_LENGTH={raw!r}. Use 5/10 or five/ten."
+        )
+    return aliases[raw]
+
+
+def _resolve_warrant_task() -> TaskType:
+    raw = os.getenv("MINER_WARRANT_TASK", "compression").strip().lower()
+    aliases = {
+        "compression": TaskType.COMPRESSION,
+        "compress": TaskType.COMPRESSION,
+        "upscaling": TaskType.UPSCALING,
+        "upscale": TaskType.UPSCALING,
+    }
+    if raw not in aliases:
+        raise ValueError(
+            f"Invalid MINER_WARRANT_TASK={raw!r}. Use compression or upscaling."
+        )
+    return aliases[raw]
+
+
+MAX_CONTENT_LEN = _resolve_max_content_length()
+warrant_task = _resolve_warrant_task()
 DEV_MODE = os.getenv("DEV_MODE", "False").lower() == "true"
+logger.info(
+    f"Miner task warrant={warrant_task.name} max_content_length={MAX_CONTENT_LEN.value}s"
+)
 
 UPSCALING_SERVICE_URL = os.getenv("MINER_UPSCALING_SERVICE_URL", "http://localhost:8003").rstrip("/")
 COMPRESSION_SERVICE_URL = os.getenv("MINER_COMPRESSION_SERVICE_URL", "http://localhost:8004").rstrip("/")
@@ -73,7 +121,7 @@ S3_ENDPOINT_URL = (
     os.getenv("MINER_STORAGE_S3_ENDPOINT_URL")
     or os.getenv("MINER_STORAGE_S3_ENDPOINT")
     or ""
-).strip()
+).strip().rstrip("+").rstrip("/")
 PRESIGNED_URL_CLEANUP_GRACE_SECONDS = int(os.getenv("PRESIGNED_URL_CLEANUP_GRACE_SECONDS", "600"))
 SHARED_VOLUME_FILE_TTL_SECONDS = int(
     os.getenv("MINER_TEMP_FILE_TTL_SECONDS")
@@ -171,6 +219,28 @@ class Miner(BaseMiner):
 
     def _should_blacklist_non_validator(self, uid: int) -> bool:
         return not DEV_MODE and not self.metagraph.validator_permit[uid]
+
+    def _uid_for_hotkey(self, hotkey: str | None) -> int | None:
+        """Resolve subnet UID; sync metagraph on demand when hotkey is missing."""
+        if not hotkey:
+            return None
+        try:
+            return self.metagraph.hotkeys.index(hotkey)
+        except ValueError:
+            pass
+        try:
+            logger.info(f"Hotkey {hotkey[:20]}... missing from metagraph; syncing chain state")
+            self.chain_sync()
+            return self.metagraph.hotkeys.index(hotkey)
+        except ValueError:
+            logger.warning(f"Unknown hotkey after metagraph sync: {hotkey}")
+            return None
+
+    def _stake_priority(self, hotkey: str | None) -> float:
+        uid = self._uid_for_hotkey(hotkey)
+        if uid is None:
+            return 0.0
+        return float(self.metagraph.S[uid])
 
     def _remove_stale_shared_file(self, path: Path, reason: str) -> int:
         try:
@@ -379,7 +449,20 @@ class Miner(BaseMiner):
 
         def _upload_and_sign() -> str:
             client = self._get_s3_client()
-            client.upload_file(str(host_path), S3_BUCKET, object_key)
+            # Multipart + parallel parts — B2 single-stream uploads were eating
+            # the ~19s upload budget and pushing rounds past 165s.
+            transfer = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024,
+                max_concurrency=8,
+                multipart_chunksize=8 * 1024 * 1024,
+                use_threads=True,
+            )
+            client.upload_file(
+                str(host_path),
+                S3_BUCKET,
+                object_key,
+                Config=transfer,
+            )
             return client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": S3_BUCKET, "Key": object_key},
@@ -422,16 +505,35 @@ class Miner(BaseMiner):
             return "Medium"
         return "Low"
 
-    def _compression_service_payload(self, payload, video_path: str, task_id: str) -> dict:
+    def _compression_service_payload(
+        self,
+        payload,
+        video_path: str,
+        task_id: str,
+        *,
+        encode_timeout_seconds: float | None = None,
+    ) -> dict:
         compression_type = self._compression_type_from_payload(payload)
+        vmaf_threshold = float(payload.vmaf_threshold)
+        # Per-clip slice of the 165s internal round (validator dendrite timeout=180).
+        clip_timeout = float(
+            encode_timeout_seconds
+            if encode_timeout_seconds is not None
+            else os.getenv("FAST_ENCODE_TIMEOUT_SECONDS", "55")
+        )
         compression_config = {
             "video_paths": [video_path],
             "task_id": task_id,
             "codec": payload.target_codec,
             "codec_mode": payload.codec_mode.upper(),
             "target_bitrate": int(float(payload.target_bitrate) * 1_000_000),
+            "vmaf_threshold": vmaf_threshold,
+            # Fast RD planner (no multi-probe VMAF) — required for 180s validator timeout.
+            "adaptive": False,
+            "encode_timeout_seconds": clip_timeout,
         }
 
+        # Seed CQ — fast_rd overrides from threshold tables.
         if compression_type == "Low":
             compression_config["cq"] = 40
         elif compression_type == "Medium":
@@ -617,14 +719,39 @@ class Miner(BaseMiner):
             ]
         )
 
-    async def _forward_compression_url_to_service(self, payload, payload_url: str) -> str | None:
+    async def _forward_compression_url_to_service(
+        self,
+        payload,
+        payload_url: str,
+        *,
+        encode_timeout_seconds: float | None = None,
+    ) -> str | None:
         task_id = uuid.uuid4().hex[:12]
+        clip_timeout = float(
+            encode_timeout_seconds
+            if encode_timeout_seconds is not None
+            else os.getenv("FAST_ENCODE_TIMEOUT_SECONDS", "55")
+        )
+        # HTTP wait must cover queue wait (wave 2) + encode — cap at internal round.
+        http_timeout = max(
+            clip_timeout + 25.0,
+            float(os.getenv("MINER_COMPRESSION_SERVICE_TIMEOUT_SECONDS", "90")),
+        )
+        http_timeout = min(
+            http_timeout,
+            float(os.getenv("SN85_INTERNAL_DEADLINE_SECONDS", "165")),
+        )
+        # Queued clips (concurrency < n) need nearly the full round.
+        if float(os.getenv("MAX_CONCURRENT_COMPRESSION", "3")) < 5:
+            http_timeout = float(os.getenv("SN85_INTERNAL_DEADLINE_SECONDS", "165"))
         if PROCESSING_BACKEND == "modal":
             return await self._call_modal_processing_function(
                 "compression",
                 MODAL_COMPRESSION_FUNCTION,
-                self._compression_service_payload(payload, payload_url, task_id),
-                COMPRESSION_SERVICE_TIMEOUT_SECONDS,
+                self._compression_service_payload(
+                    payload, payload_url, task_id, encode_timeout_seconds=clip_timeout
+                ),
+                http_timeout,
             )
 
         input_host_path = None
@@ -637,8 +764,10 @@ class Miner(BaseMiner):
                 "compression",
                 COMPRESSION_SERVICE_URL,
                 "/compress",
-                self._compression_service_payload(payload, input_container_path, task_id),
-                COMPRESSION_SERVICE_TIMEOUT_SECONDS,
+                self._compression_service_payload(
+                    payload, input_container_path, task_id, encode_timeout_seconds=clip_timeout
+                ),
+                http_timeout,
             )
             if processed_ref is None:
                 return None
@@ -657,22 +786,66 @@ class Miner(BaseMiner):
             logger.error(f"Compression payload missing reference video URLs: {self._payload_debug_dump(payload)}")
             return []
 
+        # Validator dendrite timeout=180s — finish the full 5-video bundle under 165s.
+        round_deadline = float(os.getenv("SN85_INTERNAL_DEADLINE_SECONDS", "165"))
+        n = len(urls)
+        encode_budget = float(os.getenv("SN85_ENCODE_BUDGET_SECONDS", "130"))
+        concurrency = max(1, int(os.getenv("MAX_CONCURRENT_COMPRESSION", "3")))
+        waves = (n + concurrency - 1) // concurrency
+        # e.g. 5 clips / conc 3 → 2 waves → ~65s each within 130s encode budget.
+        per_clip = encode_budget / max(1, waves)
+        per_clip = max(25.0, min(70.0, per_clip))
+        env_clip = os.getenv("FAST_ENCODE_TIMEOUT_SECONDS")
+        if env_clip:
+            per_clip = max(per_clip, float(env_clip))
+
         async def _process_one(index: int, payload_url: str) -> str:
             try:
                 item_payload = self._compression_payload_for_index(payload, index)
-                processed_url = await self._forward_compression_url_to_service(item_payload, payload_url)
+                processed_url = await self._forward_compression_url_to_service(
+                    item_payload,
+                    payload_url,
+                    encode_timeout_seconds=per_clip,
+                )
                 return processed_url or ""
             except Exception as e:
-                logger.error(f"Failed to process compression payload item {index}: {e}")
+                logger.error(
+                    f"Failed to process compression payload item {index}: "
+                    f"{type(e).__name__}: {e or repr(e)}"
+                )
                 return ""
 
-        logger.info(f"Forwarding {len(urls)} compression payload item(s) concurrently")
-        return await asyncio.gather(
-            *[
-                _process_one(index, payload_url)
-                for index, payload_url in enumerate(urls)
-            ]
+        logger.info(
+            f"Forwarding {n} compression payload item(s) concurrently "
+            f"(round_deadline={round_deadline:.0f}s per_clip_encode={per_clip:.0f}s "
+            f"concurrency={concurrency} waves={waves})"
         )
+        tasks = [
+            asyncio.create_task(_process_one(index, payload_url), name=f"comp-{index}")
+            for index, payload_url in enumerate(urls)
+        ]
+        done, pending = await asyncio.wait(tasks, timeout=round_deadline)
+        if pending:
+            logger.error(
+                f"💔 Compression batch hit internal deadline {round_deadline:.0f}s "
+                f"with {len(pending)}/{n} still running — cancelling (validator timeout=180s)"
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        results = [""] * n
+        for task in done:
+            try:
+                # Recover index from task name
+                name = task.get_name()
+                idx = int(name.split("-")[-1]) if name.startswith("comp-") else -1
+                value = task.result()
+                if 0 <= idx < n:
+                    results[idx] = value or ""
+            except Exception as e:
+                logger.error(f"Compression task failed after wait: {e}")
+        return results
 
     def _compression_payload_for_index(self, payload, index: int):
         updates = {}
@@ -737,7 +910,7 @@ class Miner(BaseMiner):
         payload_urls = self._payload_reference_video_urls(synapse.miner_payload)
         task_types = self._payload_task_types(synapse.miner_payload, len(payload_urls))
         task_type = task_types[0] if task_types else "HD24K"
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
 
         logger.info(
             f"✅✅✅ Receiving {task_type} Request from validator: {synapse.dendrite.hotkey} "
@@ -780,7 +953,7 @@ class Miner(BaseMiner):
         codec_mode: str = synapse.miner_payload.codec_mode
         target_bitrate: float = synapse.miner_payload.target_bitrate
         payload_urls = self._payload_reference_video_urls(synapse.miner_payload)
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
 
         logger.info(
             f"🛜🛜🛜 Receiving CompressionRequest from validator: {synapse.dendrite.hotkey} "
@@ -813,12 +986,12 @@ class Miner(BaseMiner):
 
     async def forward_length_check_requests(self, synapse: LengthCheckProtocol) -> LengthCheckProtocol:
 
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
         logger.info(f"⭐️⭐️⭐️ Receiving LengthCheckRequest from validator: {synapse.dendrite.hotkey} with uid: {validator_uid} ⭐️⭐️⭐️")
 
         check_version(synapse.version)
 
-        synapse.max_content_length = MAX_CONTENT_LEN
+        synapse.max_content_length = _resolve_max_content_length()
 
         return synapse
 
@@ -827,7 +1000,7 @@ class Miner(BaseMiner):
         Processes a task warrant request by verifying the task type and returning a warrant.
         """
 
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
         logger.info(f"🌕🌕🌕 Receiving TaskWarrantRequest from validator: {synapse.dendrite.hotkey} with uid: {validator_uid} 🌕🌕🌕")
 
         check_version(synapse.version)
@@ -844,7 +1017,7 @@ class Miner(BaseMiner):
         self, synapse: VideoCompressionJobProtocol
     ) -> VideoCompressionJobProtocol:
         """Phase-1: Accept a compression job and return a job_id immediately."""
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
         logger.info(
             f"📥 Receiving CompressionJob from validator uid {validator_uid} | "
             f"Codec: {synapse.miner_payload.target_codec} | Mode: {synapse.miner_payload.codec_mode}"
@@ -876,7 +1049,7 @@ class Miner(BaseMiner):
         self, synapse: VideoCompressionPollProtocol
     ) -> VideoCompressionPollProtocol:
         """Phase-2: Return the current status (and result URL if done) for a compression job."""
-        logger.info(f"⭐️⭐️⭐️ Receiving CompressionPollRequest from validator: {synapse.dendrite.hotkey} with uid: {self.metagraph.hotkeys.index(synapse.dendrite.hotkey)} ⭐️⭐️⭐️")
+        logger.info(f"⭐️⭐️⭐️ Receiving CompressionPollRequest from validator: {synapse.dendrite.hotkey} with uid: {self._uid_for_hotkey(synapse.dendrite.hotkey)} ⭐️⭐️⭐️")
         job_id = synapse.job_id
         job = self._jobs.get(job_id)
 
@@ -916,7 +1089,10 @@ class Miner(BaseMiner):
     ) -> Tuple[bool, str]:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return True, "Missing dendrite or hotkey"
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
         if self._should_blacklist_non_validator(uid):
             return True, "Non-validator hotkey"
         return False, "Hotkey recognized!"
@@ -926,15 +1102,17 @@ class Miner(BaseMiner):
     ) -> float:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return 0.0
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        return float(self.metagraph.S[caller_uid])
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_compression_poll_requests(
         self, synapse: VideoCompressionPollProtocol
     ) -> Tuple[bool, str]:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return True, "Missing dendrite or hotkey"
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
         if self._should_blacklist_non_validator(uid):
             return True, "Non-validator hotkey"
         return False, "Hotkey recognized!"
@@ -944,8 +1122,7 @@ class Miner(BaseMiner):
     ) -> float:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return 0.0
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        return float(self.metagraph.S[caller_uid])
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     # ---------------------------------------------------------------------------
     # Polling-based organic upscaling handlers
@@ -955,7 +1132,7 @@ class Miner(BaseMiner):
         self, synapse: VideoUpscalingJobProtocol
     ) -> VideoUpscalingJobProtocol:
         """Phase-1: Accept an upscaling job and return a job_id immediately."""
-        validator_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        validator_uid: int = self._uid_for_hotkey(synapse.dendrite.hotkey)
         logger.info(
             f"📥 Receiving UpscalingJob from validator uid {validator_uid} | "
             f"task_type: {synapse.miner_payload.task_type}"
@@ -1026,7 +1203,10 @@ class Miner(BaseMiner):
     ) -> Tuple[bool, str]:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return True, "Missing dendrite or hotkey"
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
         if self._should_blacklist_non_validator(uid):
             return True, "Non-validator hotkey"
         return False, "Hotkey recognized!"
@@ -1036,15 +1216,17 @@ class Miner(BaseMiner):
     ) -> float:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return 0.0
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        return float(self.metagraph.S[caller_uid])
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_upscaling_poll_requests(
         self, synapse: VideoUpscalingPollProtocol
     ) -> Tuple[bool, str]:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return True, "Missing dendrite or hotkey"
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
         if self._should_blacklist_non_validator(uid):
             return True, "Non-validator hotkey"
         return False, "Hotkey recognized!"
@@ -1054,8 +1236,7 @@ class Miner(BaseMiner):
     ) -> float:
         if not synapse.dendrite or not synapse.dendrite.hotkey:
             return 0.0
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        return float(self.metagraph.S[caller_uid])
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_upscaling_requests(self, synapse: VideoUpscalingProtocol) -> Tuple[bool, str]:
         """
@@ -1065,7 +1246,11 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return True, "Missing dendrite or hotkey"
 
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
 
         if self._should_blacklist_non_validator(uid):
             logger.warning(f"Blacklisting non-validator hotkey {synapse.dendrite.hotkey}")
@@ -1083,11 +1268,7 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return 0.0
 
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority: float = float(self.metagraph.S[caller_uid])
-        
-        logger.trace(f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}")
-        return priority
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_length_check_requests(self, synapse: LengthCheckProtocol) -> Tuple[bool, str]:
         """
@@ -1097,7 +1278,11 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return True, "Missing dendrite or hotkey"
 
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
 
         if self._should_blacklist_non_validator(uid):
             logger.warning(f"Blacklisting non-validator hotkey {synapse.dendrite.hotkey}")
@@ -1115,11 +1300,7 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return 0.0
 
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority: float = float(self.metagraph.S[caller_uid])
-        
-        logger.trace(f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}")
-        return priority
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_compression_requests(self, synapse: VideoCompressionProtocol) -> Tuple[bool, str]:
         """
@@ -1129,7 +1310,11 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return True, "Missing dendrite or hotkey"
 
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
 
         if self._should_blacklist_non_validator(uid):
             logger.warning(f"Blacklisting non-validator hotkey {synapse.dendrite.hotkey}")
@@ -1147,11 +1332,7 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return 0.0
 
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority: float = float(self.metagraph.S[caller_uid])
-        
-        logger.trace(f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}")
-        return priority
+        return self._stake_priority(synapse.dendrite.hotkey)
 
     async def blacklist_task_warrant_requests(self, synapse: TaskWarrantProtocol) -> Tuple[bool, str]:
         """
@@ -1161,7 +1342,11 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return True, "Missing dendrite or hotkey"   
 
-        uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        uid = self._uid_for_hotkey(synapse.dendrite.hotkey)
+
+        if uid is None:
+            logger.warning(f"Blacklisting unknown hotkey {synapse.dendrite.hotkey}")
+            return True, "Unknown hotkey"
 
         if self._should_blacklist_non_validator(uid):
             logger.warning(f"Blacklisting non-validator hotkey {synapse.dendrite.hotkey}")
@@ -1179,11 +1364,7 @@ class Miner(BaseMiner):
             logger.warning("Received a request without a dendrite or hotkey.")
             return 0.0
 
-        caller_uid: int = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority: float = float(self.metagraph.S[caller_uid])
-
-        logger.trace(f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}")
-        return priority
+        return self._stake_priority(synapse.dendrite.hotkey)
 
 if __name__ == "__main__":
     with Miner() as miner:

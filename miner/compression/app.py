@@ -24,6 +24,21 @@ from botocore.config import Config
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from adaptive import ADAPTIVE_ENABLED_DEFAULT, optimize_compression, record_vmaf_calibration
+from deadline_controller import ENCODE_BUDGET, INTERNAL_DEADLINE_SECONDS
+from integrity import validate_output_matches_source
+from perf_db import record_encode, suggest_fallback_preset
+from rd_predictor import select_plan
+from source_features import extract_source_features
+from vbr_plan import plan_vbr
+from vmaf_local import calculate_vmaf_aligned_window
+
+# Fast RD is the production path — full multi-probe VMAF search blows the 180s validator timeout.
+FAST_RD_MODE = os.getenv("FAST_RD_MODE", "true").lower() in ("1", "true", "yes")
+ADAPTIVE_FULL_SEARCH = os.getenv("ADAPTIVE_FULL_SEARCH", "false").lower() in ("1", "true", "yes")
+# Per-clip encode wall when 5 videos run concurrently under a 165s round.
+DEFAULT_PER_CLIP_ENCODE_TIMEOUT = float(os.getenv("FAST_ENCODE_TIMEOUT_SECONDS", "55"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -34,6 +49,7 @@ log = logging.getLogger("compression")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await _detect_nvenc_available()
     cleanup_task = asyncio.create_task(_cleanup_worker())
     try:
         yield
@@ -46,7 +62,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Video Compression Service", lifespan=lifespan)
 
 SHARED_VOLUME_PATH = os.getenv("SHARED_VOLUME_PATH", "/tmp/organic-proxy")
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_COMPRESSION", "2"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_COMPRESSION", "3"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE_COMPRESSION") or os.getenv("MAX_QUEUE_SIZE", "5"))
 DISABLE_REMOTE_IO = os.getenv("DISABLE_REMOTE_IO", "false").lower() in ("1", "true", "yes")
 
@@ -60,7 +76,7 @@ S3_ENDPOINT_URL = (
     os.getenv("MINER_STORAGE_S3_ENDPOINT_URL")
     or os.getenv("MINER_STORAGE_S3_ENDPOINT")
     or ""
-).strip()
+).strip().rstrip("+").rstrip("/")
 S3_PRESIGNED_EXPIRY = int(
     os.getenv("MINER_STORAGE_S3_PRESIGNED_EXPIRY")
     or os.getenv("S3_PRESIGNED_EXPIRY")
@@ -109,6 +125,45 @@ COMPRESSION_CHUNK_TARGET_SECONDS = int(os.getenv("COMPRESSION_CHUNK_TARGET_SECON
 COMPRESSION_CHUNK_PARALLELISM = max(1, int(os.getenv("COMPRESSION_CHUNK_PARALLELISM", "2")))
 FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+# Default final-encode presets (adaptive may override per-request via req.preset).
+SVT_PRESET = os.getenv("ADAPTIVE_SVT_PRESET", os.getenv("FAST_SVT_PRESET", "9"))
+X265_PRESET = os.getenv("ADAPTIVE_X265_PRESET", os.getenv("FAST_X265_PRESET", "ultrafast"))
+SVT_PARAMS = os.getenv(
+    "ADAPTIVE_SVT_PARAMS",
+    "tune=0",  # keep light — overlays/tf cost wall-clock under 180s deadline
+)
+X265_PARAMS = os.getenv(
+    "ADAPTIVE_X265_PARAMS",
+    "aq-mode=3:rc-lookahead=5:frame-threads=4",
+)
+# Cap encoder threads so concurrent clips don't oversubscribe 24-core H200.
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+_SVT_LP = _env_int("SVT_LP", max(2, (os.cpu_count() or 8) // max(1, MAX_CONCURRENT)))
+_X265_POOLS = _env_int("X265_POOLS", max(2, (os.cpu_count() or 8) // max(1, MAX_CONCURRENT)))
+COMPRESSION_DEADLINE_SECONDS = float(
+    os.getenv("MINER_COMPRESSION_SERVICE_TIMEOUT_SECONDS", str(DEFAULT_PER_CLIP_ENCODE_TIMEOUT + 20))
+)
+_X265_PRESETS = {
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+}
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _queue_size = 0
@@ -116,7 +171,8 @@ _active_count = 0
 _active_file_paths: set[str] = set()
 _lock = asyncio.Lock()
 
-# Codec name → nvenc/software encoder mapping
+# Codec name → preferred encoder mapping. H100/H200 datacenter GPUs often
+# lack NVENC; software fallbacks are selected automatically at startup.
 CODEC_MAP = {
     "AV1": "av1_nvenc",
     "H264": "h264_nvenc",
@@ -126,6 +182,284 @@ CODEC_MAP = {
     "H.265": "hevc_nvenc",
     "VP9": "libvpx-vp9",
 }
+
+SOFTWARE_CODEC_MAP = {
+    "AV1": "libsvtav1",
+    "H264": "libx264",
+    "H.264": "libx264",
+    "HEVC": "libx265",
+    "H265": "libx265",
+    "H.265": "libx265",
+    "VP9": "libvpx-vp9",
+}
+
+_nvenc_available: bool | None = None
+
+
+async def _detect_nvenc_available() -> bool:
+    global _nvenc_available
+    if _nvenc_available is not None:
+        return _nvenc_available
+    cmd = [
+        FFMPEG_BIN,
+        "-hide_banner",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:d=0.1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ]
+    returncode, _, stderr, run_error = await _run_process(cmd, "nvenc-probe", "probe")
+    ok = returncode == 0 and not run_error
+    if not ok:
+        log.warning(
+            "NVENC unavailable on this GPU/runtime; using software encoders "
+            f"(libsvtav1/libx265/libx264). detail={(run_error or stderr.decode(errors='replace'))[-200:]}"
+        )
+    _nvenc_available = ok
+    return ok
+
+
+def _resolve_encoder(codec: str, prefer_nvenc: bool) -> str:
+    key = codec.upper()
+    if prefer_nvenc:
+        return CODEC_MAP.get(key, "av1_nvenc")
+    return SOFTWARE_CODEC_MAP.get(key, "libsvtav1")
+
+
+def _is_software_encoder(encoder: str) -> bool:
+    return encoder in {"libsvtav1", "libx264", "libx265", "libvpx-vp9"}
+
+
+def _software_preset(encoder: str, req_preset: str) -> str:
+    """Prefer adaptive-selected preset when it looks like a real encoder preset."""
+    if encoder == "libsvtav1":
+        if req_preset and str(req_preset).isdigit():
+            return str(req_preset)
+        return SVT_PRESET
+    if encoder in {"libx264", "libx265"}:
+        if req_preset and str(req_preset).lower() in _X265_PRESETS:
+            return str(req_preset).lower()
+        return X265_PRESET
+    return req_preset or SVT_PRESET
+
+
+def _svt_preset_for_source(req_preset: str, *, width: int = 0, height: int = 0) -> str:
+    """Clamp SVT preset for 4K — v4.1 RA mode rejects >9 at UHD."""
+    raw = _software_preset("libsvtav1", req_preset)
+    try:
+        level = int(raw)
+    except ValueError:
+        level = int(SVT_PRESET) if str(SVT_PRESET).isdigit() else 9
+    # Challenge clips are almost always 4K; keep safe default even if probe skipped.
+    uhd = (width * height) >= (3840 * 2160) or width == 0
+    if uhd:
+        level = min(level, 9)
+    return str(max(0, min(12, level)))
+
+
+def _merge_encoder_params(base: str, extra: str) -> str:
+    parts = [p for p in (base or "").split(":") if p]
+    seen = {p.split("=", 1)[0] for p in parts}
+    for p in (extra or "").split(":"):
+        if not p:
+            continue
+        key = p.split("=", 1)[0]
+        if key not in seen:
+            parts.append(p)
+            seen.add(key)
+    return ":".join(parts)
+
+
+def _svt_params_with_threads(color: dict[str, str] | None = None) -> str:
+    """Size SVT logical processors to nproc/concurrency; tag color for validator gates."""
+    params = _merge_encoder_params(SVT_PARAMS, f"lp={_SVT_LP}")
+    if color:
+        mapping = {
+            "color_primaries": "color-primaries",
+            "color_transfer": "transfer-characteristics",
+            "color_space": "matrix-coefficients",
+        }
+        extras = []
+        for src_key, dst_key in mapping.items():
+            val = (color.get(src_key) or "").strip()
+            if val and val not in {"unknown", "unspecified"}:
+                extras.append(f"{dst_key}={val}")
+        if extras:
+            params = _merge_encoder_params(params, ":".join(extras))
+    return params
+
+
+def _x265_params_with_threads(
+    zones: str | None = None,
+    color: dict[str, str] | None = None,
+) -> str:
+    params = _merge_encoder_params(
+        X265_PARAMS, f"pools={_X265_POOLS}:frame-threads={min(4, _X265_POOLS)}"
+    )
+    if color:
+        mapping = {
+            "color_primaries": "colorprim",
+            "color_transfer": "transfer",
+            "color_space": "colormatrix",
+        }
+        extras = []
+        for src_key, dst_key in mapping.items():
+            val = (color.get(src_key) or "").strip()
+            if val and val not in {"unknown", "unspecified"}:
+                extras.append(f"{dst_key}={val}")
+        if extras:
+            params = _merge_encoder_params(params, ":".join(extras))
+    if zones:
+        params = _merge_encoder_params(params, f"zones={zones}")
+    return params
+
+
+async def _probe_color_tags(path: str) -> dict[str, str]:
+    """Read source color tags so outputs pass validator colorspace gates."""
+    cmd = [
+        FFPROBE_BIN,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=color_space,color_primaries,color_transfer",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        rc, stdout, stderr, err = await _run_process(cmd, "color-probe", "probe", timeout=3.0)
+        if rc != 0 or err:
+            return {}
+        data = json.loads(stdout.decode(errors="replace") or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        out: dict[str, str] = {}
+        for key in ("color_space", "color_primaries", "color_transfer"):
+            val = stream.get(key)
+            if val and str(val) not in {"unknown", "unspecified", "none"}:
+                out[key] = str(val)
+        return out
+    except Exception as exc:
+        log.debug(f"color probe failed: {exc}")
+        return {}
+
+
+def _build_ffmpeg_args(
+    local_input: str,
+    output_path: str,
+    req: "CompressRequest",
+    encoder: str,
+    *,
+    x265_zones: str | None = None,
+    vbr_bitrate_bps: int | None = None,
+    vbr_maxrate_bps: int | None = None,
+    vbr_bufsize_bps: int | None = None,
+    pass_num: int | None = None,
+    passlogfile: str | None = None,
+    color: dict[str, str] | None = None,
+    width: int = 0,
+    height: int = 0,
+) -> list[str]:
+    ffmpeg_args = [
+        FFMPEG_BIN,
+        "-y",
+        "-threads",
+        str(max(2, _SVT_LP)),
+    ]
+    if not _is_software_encoder(encoder):
+        ffmpeg_args.extend(["-hwaccel", "cuda"])
+
+    ffmpeg_args.extend([
+        "-i", local_input,
+        "-map", "0:v:0",
+    ])
+    if pass_num != 1:
+        ffmpeg_args.extend(["-map", "0:a?"])
+    ffmpeg_args.extend(["-c:v", encoder])
+
+    bitrate = vbr_bitrate_bps or req.target_bitrate
+    if req.codec_mode == "VBR" and bitrate:
+        ffmpeg_args.extend(["-b:v", str(int(bitrate))])
+        # SVT-AV1: -maxrate/-bufsize map to mbr which is CRF-only → hard fail in VBR.
+        if encoder != "libsvtav1":
+            if vbr_maxrate_bps:
+                ffmpeg_args.extend(["-maxrate", str(int(vbr_maxrate_bps))])
+            if vbr_bufsize_bps:
+                ffmpeg_args.extend(["-bufsize", str(int(vbr_bufsize_bps))])
+        if encoder == "libsvtav1":
+            ffmpeg_args.extend([
+                "-preset",
+                _svt_preset_for_source(req.preset, width=width, height=height),
+            ])
+            params = _svt_params_with_threads(color)
+            if params:
+                ffmpeg_args.extend(["-svtav1-params", params])
+        elif encoder in {"libx264", "libx265"}:
+            ffmpeg_args.extend(["-preset", _software_preset(encoder, req.preset)])
+            if pass_num is not None:
+                ffmpeg_args.extend(["-pass", str(pass_num)])
+                if passlogfile:
+                    ffmpeg_args.extend(["-passlogfile", passlogfile])
+            if encoder == "libx265":
+                params = _x265_params_with_threads(x265_zones, color)
+                if params:
+                    ffmpeg_args.extend(["-x265-params", params])
+        elif not _is_software_encoder(encoder):
+            ffmpeg_args.extend(["-preset", req.preset])
+    elif encoder == "libsvtav1":
+        ffmpeg_args.extend([
+            "-crf",
+            str(req.cq),
+            "-preset",
+            _svt_preset_for_source(req.preset, width=width, height=height),
+        ])
+        params = _svt_params_with_threads(color)
+        if params:
+            ffmpeg_args.extend(["-svtav1-params", params])
+    elif encoder in {"libx264", "libx265"}:
+        ffmpeg_args.extend(["-crf", str(req.cq), "-preset", _software_preset(encoder, req.preset)])
+        if encoder == "libx265":
+            params = _x265_params_with_threads(x265_zones, color)
+            if params:
+                ffmpeg_args.extend(["-x265-params", params])
+    elif encoder == "libvpx-vp9":
+        ffmpeg_args.extend(["-crf", str(req.cq), "-b:v", "0"])
+    else:
+        ffmpeg_args.extend(["-cq", str(req.cq), "-preset", req.preset])
+
+    # Validator hard-requires yuv420p + 1:1 SAR; color tags must match source.
+    video_filters = []
+    if req.target_width and req.target_height:
+        w = req.target_width if req.target_width % 2 == 0 else req.target_width - 1
+        h = req.target_height if req.target_height % 2 == 0 else req.target_height - 1
+        video_filters.append(f"scale={w}:{h}")
+
+    video_filters.append("setsar=1")
+    video_filters.append("format=yuv420p")
+    ffmpeg_args.extend(["-vf", ",".join(video_filters)])
+    ffmpeg_args.extend(["-pix_fmt", "yuv420p"])
+
+    if color:
+        if color.get("color_space"):
+            ffmpeg_args.extend(["-colorspace", color["color_space"]])
+        if color.get("color_primaries"):
+            ffmpeg_args.extend(["-color_primaries", color["color_primaries"]])
+        if color.get("color_transfer"):
+            ffmpeg_args.extend(["-color_trc", color["color_transfer"]])
+
+    if pass_num == 1:
+        ffmpeg_args.extend(["-an", "-f", "null", os.devnull])
+    else:
+        ffmpeg_args.extend(["-c:a", "copy", "-sn", "-dn", "-movflags", "+faststart", output_path])
+    return ffmpeg_args
 
 
 def _is_url(path: str) -> bool:
@@ -161,6 +495,20 @@ def _compression_config_status() -> dict[str, object]:
         "chunk_min_duration_seconds": COMPRESSION_CHUNK_MIN_DURATION_SECONDS,
         "chunk_target_seconds": COMPRESSION_CHUNK_TARGET_SECONDS,
         "chunk_parallelism": COMPRESSION_CHUNK_PARALLELISM,
+        "adaptive_enabled_default": ADAPTIVE_ENABLED_DEFAULT,
+        "fast_rd_mode": FAST_RD_MODE,
+        "adaptive_full_search": ADAPTIVE_FULL_SEARCH,
+        "adaptive_vmaf_margin": float(os.getenv("ADAPTIVE_VMAF_MARGIN", "0.8")),
+        "per_clip_encode_timeout": DEFAULT_PER_CLIP_ENCODE_TIMEOUT,
+        "internal_round_deadline": INTERNAL_DEADLINE_SECONDS,
+        "encode_budget": ENCODE_BUDGET,
+        "deadline_seconds": COMPRESSION_DEADLINE_SECONDS,
+        "svt_preset": SVT_PRESET,
+        "x265_preset": X265_PRESET,
+        "svt_lp": _SVT_LP,
+        "x265_pools": _X265_POOLS,
+        "force_one_pass_vbr": os.getenv("SN85_FORCE_ONE_PASS_VBR", "true").lower() in ("1", "true", "yes"),
+        "vmaf_model": os.getenv("ADAPTIVE_VMAF_MODEL", "version=vmaf_v0.6.1neg"),
     }
 
 
@@ -226,7 +574,14 @@ def _format_process_output(stdout: bytes, stderr: bytes) -> str:
     return "\n\n".join(parts)
 
 
-async def _run_process(cmd: list[str], task_label: str, step: str) -> tuple[int | None, bytes, bytes, str]:
+async def _run_process(
+    cmd: list[str],
+    task_label: str,
+    step: str,
+    *,
+    timeout: float | None = None,
+) -> tuple[int | None, bytes, bytes, str]:
+    proc = None
     try:
         log.info(f"[{task_label}] {step}: {' '.join(cmd)}")
         proc = await asyncio.create_subprocess_exec(
@@ -234,7 +589,18 @@ async def _run_process(cmd: list[str], task_label: str, step: str) -> tuple[int 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        if timeout and timeout > 0:
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                log.error(f"[{task_label}] {step} timed out after {timeout:.0f}s — killing")
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(Exception):
+                    await proc.communicate()
+                return None, b"", b"", f"timeout after {timeout:.0f}s"
+        else:
+            stdout, stderr = await proc.communicate()
         return proc.returncode, stdout, stderr, ""
     except FileNotFoundError:
         return None, b"", b"", f"{cmd[0]} binary not found"
@@ -299,37 +665,6 @@ async def _log_chunk_seams(segments: list[str], task_label: str) -> list[float]:
         )
     )
     return seams
-
-
-def _build_ffmpeg_args(local_input: str, output_path: str, req: "CompressRequest", encoder: str) -> list[str]:
-    ffmpeg_args = [
-        FFMPEG_BIN,
-        "-y",
-        "-hwaccel", "cuda",
-        "-i", local_input,
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-c:v", encoder,
-    ]
-
-    if req.codec_mode == "VBR" and req.target_bitrate:
-        ffmpeg_args.extend(["-b:v", str(req.target_bitrate)])
-    else:
-        ffmpeg_args.extend(["-cq", str(req.cq)])
-
-    ffmpeg_args.extend(["-preset", req.preset])
-
-    video_filters = []
-    if req.target_width and req.target_height:
-        w = req.target_width if req.target_width % 2 == 0 else req.target_width - 1
-        h = req.target_height if req.target_height % 2 == 0 else req.target_height - 1
-        video_filters.append(f"scale={w}:{h}")
-
-    video_filters.append("setsar=1")
-    ffmpeg_args.extend(["-vf", ",".join(video_filters)])
-
-    ffmpeg_args.extend(["-c:a", "copy", "-sn", "-dn", "-movflags", "+faststart", output_path])
-    return ffmpeg_args
 
 
 def _should_chunk(req: "CompressRequest", duration_seconds: float | None) -> bool:
@@ -715,7 +1050,7 @@ class CompressRequest(BaseModel):
     task_id: str = Field("", description="Task ID for logging")
     codec: str = Field("AV1", description="Target codec: AV1, H264, HEVC, VP9")
     codec_mode: str = Field("CRF", description="Rate control mode: CRF or VBR")
-    cq: int = Field(35, description="Constant quality value (lower = higher quality)")
+    cq: int = Field(35, description="Seed CQ / fallback (lower = higher quality)")
     preset: str = Field("p4", description="Encoder preset")
     target_bitrate: Optional[int] = Field(None, description="Target bitrate in bps (for VBR mode)")
     target_width: Optional[int] = Field(None, description="Target width for downscaling")
@@ -723,6 +1058,18 @@ class CompressRequest(BaseModel):
     chunked: Optional[bool] = Field(None, description="Override automatic long-video chunking")
     chunk_duration_seconds: Optional[int] = Field(None, description="Target chunk duration")
     chunk_parallelism: Optional[int] = Field(None, description="Parallel chunk encodes per request")
+    vmaf_threshold: Optional[float] = Field(
+        None,
+        description="Validator VMAF threshold used by adaptive CQ search (e.g. 85/89/93)",
+    )
+    adaptive: Optional[bool] = Field(
+        None,
+        description="Enable adaptive CQ search. Defaults to ADAPTIVE_COMPRESSION env.",
+    )
+    encode_timeout_seconds: Optional[float] = Field(
+        None,
+        description="Hard encode wall-clock for this clip (SN85 batch deadline slice)",
+    )
 
 
 class CompressResponse(BaseModel):
@@ -751,9 +1098,158 @@ async def queue_status():
     return await _queue_snapshot()
 
 
+async def _calibrate_sample_vs_output(
+    source_path: str,
+    output_path: str,
+    predicted_vmaf: float | None,
+    task_label: str,
+) -> None:
+    """Update dynamic margin from sample-predicted vs aligned mid-clip VMAF."""
+    if predicted_vmaf is None or predicted_vmaf <= 0:
+        return
+    try:
+        duration = await _probe_duration_seconds(source_path, task_label) or 0.0
+        start = max(0.0, duration * 0.40)
+        sample_len = min(2.5, max(1.0, duration * 0.08)) if duration > 0 else 2.0
+        measured = await calculate_vmaf_aligned_window(
+            source_path,
+            output_path,
+            start_seconds=start,
+            duration_seconds=sample_len,
+        )
+        under = predicted_vmaf - measured.score_signal
+        record_vmaf_calibration(predicted_vmaf, measured.score_signal)
+        log.info(
+            f"[{task_label}] calibration pred={predicted_vmaf:.2f} "
+            f"measured={measured.score_signal:.2f} under={under:.2f}"
+        )
+    except Exception as exc:
+        log.warning(f"[{task_label}] calibration skipped: {exc}")
+
+
+async def _encode_with_deadline(
+    local_input: str,
+    output_path: str,
+    req: "CompressRequest",
+    encoder: str,
+    task_label: str,
+    *,
+    encode_timeout: float,
+    x265_zones: str | None = None,
+    duration_seconds: float | None = None,
+    complexity: str = "medium",
+    width: int = 0,
+    height: int = 0,
+    color: dict[str, str] | None = None,
+) -> tuple[int | None, bytes, bytes, str]:
+    """Final encode with hard timeout and one faster fallback before failure."""
+    encode_t0 = time.monotonic()
+
+    def _args(active_req, zones=None, **kwargs):
+        return _build_ffmpeg_args(
+            local_input,
+            output_path,
+            active_req,
+            encoder,
+            x265_zones=zones,
+            color=color,
+            width=width,
+            height=height,
+            **kwargs,
+        )
+
+    async def _once(active_req: "CompressRequest", zones: str | None, label: str, timeout: float):
+        if active_req.codec_mode.upper() == "VBR" and active_req.target_bitrate:
+            plan = plan_vbr(
+                encoder=encoder,
+                target_bitrate_bps=int(active_req.target_bitrate),
+                duration_seconds=float(duration_seconds or 30.0),
+                width=width or 1920,
+                height=height or 1080,
+                complexity=complexity,
+                preset=_software_preset(encoder, active_req.preset),
+                deadline_left=timeout,
+            )
+            log.info(f"[{task_label}] vbr_plan {plan.reason} bitrate={plan.target_bitrate_bps}")
+            active_req = active_req.model_copy(update={"preset": plan.preset})
+            if plan.two_pass and encoder in {"libx264", "libx265"}:
+                passlog = os.path.join(SHARED_VOLUME_PATH, f"{task_label}_ffmpeg2pass")
+                cmd1 = _args(
+                    active_req,
+                    vbr_bitrate_bps=plan.target_bitrate_bps,
+                    vbr_maxrate_bps=plan.maxrate_bps,
+                    vbr_bufsize_bps=plan.bufsize_bps,
+                    pass_num=1,
+                    passlogfile=passlog,
+                )
+                half = max(30.0, timeout * 0.45)
+                rc1, so1, se1, err1 = await _run_process(cmd1, task_label, f"{label} pass1", timeout=half)
+                if rc1 != 0 or err1:
+                    return rc1, so1, se1, err1 or "vbr pass1 failed"
+                cmd2 = _args(
+                    active_req,
+                    zones,
+                    vbr_bitrate_bps=plan.target_bitrate_bps,
+                    vbr_maxrate_bps=plan.maxrate_bps,
+                    vbr_bufsize_bps=plan.bufsize_bps,
+                    pass_num=2,
+                    passlogfile=passlog,
+                )
+                return await _run_process(
+                    cmd2, task_label, f"{label} pass2", timeout=max(30.0, timeout - (time.monotonic() - encode_t0))
+                )
+            cmd = _args(
+                active_req,
+                zones,
+                vbr_bitrate_bps=plan.target_bitrate_bps,
+                vbr_maxrate_bps=plan.maxrate_bps,
+                vbr_bufsize_bps=plan.bufsize_bps,
+            )
+            return await _run_process(cmd, task_label, label, timeout=timeout)
+
+        cmd = _args(active_req, zones)
+        return await _run_process(cmd, task_label, label, timeout=timeout)
+
+    # Reserve a real fallback window up front — leftover after a full timeout is useless (~4s).
+    primary_budget = max(8.0, encode_timeout * 0.78)
+    fallback_budget = max(0.0, encode_timeout - primary_budget)
+    rc, stdout, stderr, err = await _once(req, x265_zones, "final encode", primary_budget)
+    if err.startswith("timeout") or (rc is not None and rc != 0):
+        if fallback_budget >= 10.0:
+            fb_preset = suggest_fallback_preset(encoder, req.preset)
+            fb_cq = max(10, int(req.cq) - 1) if req.codec_mode.upper() != "VBR" else req.cq
+            fb_req = req.model_copy(update={"preset": fb_preset, "cq": fb_cq})
+            log.warning(
+                f"[{task_label}] encode fallback preset={fb_preset} cq={fb_cq} "
+                f"timeout={fallback_budget:.0f}s (prior: {err or rc})"
+            )
+            _cleanup(output_path)
+            rc, stdout, stderr, err = await _once(fb_req, None, "fallback encode", fallback_budget)
+        else:
+            log.error(
+                f"[{task_label}] encode failed and fallback budget too small "
+                f"({fallback_budget:.0f}s); prior={err or rc}"
+            )
+
+    wall = time.monotonic() - encode_t0
+    if rc == 0 and duration_seconds:
+        record_encode(
+            codec=encoder,
+            width=width or 1920,
+            height=height or 1080,
+            complexity=complexity,
+            preset=str(req.preset),
+            duration_seconds=float(duration_seconds),
+            wall_seconds=wall,
+            cq=req.cq,
+        )
+    return rc, stdout, stderr, err
+
+
 async def _compress_one(req: CompressRequest, input_video: str, task_label: str) -> CompressResponse:
     remote_mode = _is_url(input_video)
-    encoder = CODEC_MAP.get(req.codec.upper(), "av1_nvenc")
+    prefer_nvenc = await _detect_nvenc_available()
+    encoder = _resolve_encoder(req.codec, prefer_nvenc)
 
     if remote_mode and DISABLE_REMOTE_IO:
         return CompressResponse(success=False, errors=["Remote URL input is disabled for this local-only service"])
@@ -798,38 +1294,210 @@ async def _compress_one(req: CompressRequest, input_video: str, task_label: str)
 
             duration_seconds = await _probe_duration_seconds(local_input, task_label)
             use_chunked = _should_chunk(req, duration_seconds)
+            color_tags = await _probe_color_tags(local_input)
+            if color_tags:
+                log.info(f"[{task_label}] source color tags: {color_tags}")
 
+            # Hold the concurrency slot for adaptive search + final encode.
+            # Running adaptive outside the semaphore let all 5 validator clips
+            # probe CQ in parallel and blow past the miner HTTP timeout.
             async with _running_task() as running_snapshot:
+                request_t0 = time.monotonic()
+                effective_req = req
+                x265_zones: str | None = None
+                predicted_vmaf: float | None = None
+                complexity = "medium"
+                width = 0
+                height = 0
+                encode_timeout = float(
+                    req.encode_timeout_seconds
+                    if req.encode_timeout_seconds is not None
+                    else DEFAULT_PER_CLIP_ENCODE_TIMEOUT
+                )
+                vmaf_threshold = float(req.vmaf_threshold) if req.vmaf_threshold is not None else 85.0
+
+                # --- Fast RD path (default): features → plan → encode. No multi-probe VMAF. ---
+                use_full_search = ADAPTIVE_FULL_SEARCH and (
+                    ADAPTIVE_ENABLED_DEFAULT if req.adaptive is None else req.adaptive
+                )
+                if FAST_RD_MODE or not use_full_search:
+                    try:
+                        features = await extract_source_features(local_input, timeout=2.5)
+                        complexity = features.complexity
+                        width = features.width
+                        height = features.height
+                        remaining = max(5.0, encode_timeout - (time.monotonic() - request_t0))
+                        bitrate_bps = None
+                        if req.codec_mode.upper() == "VBR" and req.target_bitrate:
+                            # Validator target_bitrate is Mbps in miner payload; service may get bps.
+                            raw = int(req.target_bitrate)
+                            bitrate_bps = raw if raw > 100_000 else raw * 1_000_000
+                        plan = select_plan(
+                            features,
+                            encoder=encoder,
+                            vmaf_threshold=vmaf_threshold,
+                            codec_mode=req.codec_mode,
+                            target_bitrate_bps=bitrate_bps,
+                            remaining_seconds=remaining,
+                        )
+                        updates = {"cq": plan.cq, "preset": plan.preset}
+                        if plan.codec_mode == "VBR" and plan.target_bitrate_bps:
+                            updates["target_bitrate"] = plan.target_bitrate_bps
+                            updates["codec_mode"] = "VBR"
+                        effective_req = req.model_copy(update=updates)
+                        log.info(
+                            f"[{task_label}] fast_rd {plan.reason} "
+                            f"expect_score≈{plan.expected_score_lo:.2f}-{plan.expected_score_hi:.2f} "
+                            f"timeout={encode_timeout:.0f}s"
+                        )
+                    except Exception as e:
+                        log.warning(f"[{task_label}] fast_rd failed, seed cq={req.cq}: {e}")
+                        # Emergency: fastest preset
+                        fb = "9" if encoder == "libsvtav1" else "ultrafast"
+                        effective_req = req.model_copy(update={"preset": fb})
+                elif use_full_search and req.codec_mode.upper() != "VBR":
+                    try:
+                        decision = await optimize_compression(
+                            local_input,
+                            encoder=encoder,
+                            vmaf_threshold=vmaf_threshold,
+                            seed_cq=req.cq,
+                            preset=req.preset,
+                            target_width=req.target_width,
+                            target_height=req.target_height,
+                            enabled=True,
+                            work_root=os.path.join(SHARED_VOLUME_PATH, f"{task_label}_adaptive"),
+                            deadline_seconds=encode_timeout,
+                        )
+                        log.info(f"[{task_label}] adaptive_decision {json.dumps(decision.to_log_dict())}")
+                        if decision.cq != req.cq or decision.preset != req.preset:
+                            effective_req = req.model_copy(update={"cq": decision.cq, "preset": decision.preset})
+                        x265_zones = decision.x265_zones
+                        if decision.selected:
+                            predicted_vmaf = decision.selected.vmaf_hmean
+                        if decision.analysis:
+                            complexity = decision.analysis.complexity.value
+                            width = decision.analysis.width
+                            height = decision.analysis.height
+                    except Exception as e:
+                        log.warning(f"[{task_label}] adaptive search failed, using seed cq={req.cq}: {e}")
+
+                # Never let encode exceed remaining per-clip budget.
+                elapsed = time.monotonic() - request_t0
+                encode_timeout = max(5.0, encode_timeout - elapsed)
+
+                # Disable chunking under the 180s validator path — too much overhead.
+                use_chunked = False
+
                 log.info(
                     f"[{task_label}] Starting compression "
                     f"(active={running_snapshot['active_tasks']}/{MAX_CONCURRENT}, "
                     f"queued={running_snapshot['queued_tasks']}, "
-                    f"duration={duration_seconds}, chunked={use_chunked})"
+                    f"duration={duration_seconds}, chunked={use_chunked}, "
+                    f"cq={effective_req.cq}, preset={effective_req.preset}, "
+                    f"encode_timeout={encode_timeout:.0f}s, zones={'yes' if x265_zones else 'no'})"
                 )
 
                 if use_chunked:
                     try:
-                        await _compress_chunked(local_input, output_path, req, encoder, task_label)
+                        await _compress_chunked(
+                            local_input, output_path, effective_req, encoder, task_label
+                        )
                         returncode = 0
                     except RuntimeError as e:
                         if "falling back to single-pass compression" in str(e):
                             log.warning(f"[{task_label}] {e}")
-                            cmd = _build_ffmpeg_args(local_input, output_path, req, encoder)
-                            returncode, stdout, stderr, run_error = await _run_process(
-                                cmd,
+                            returncode, stdout, stderr, run_error = await _encode_with_deadline(
+                                local_input,
+                                output_path,
+                                effective_req,
+                                encoder,
                                 task_label,
-                                "single-pass compression fallback",
+                                encode_timeout=encode_timeout,
+                                x265_zones=x265_zones,
+                                duration_seconds=duration_seconds,
+                                complexity=complexity,
+                                width=width,
+                                height=height,
+                                color=color_tags,
                             )
                         else:
                             run_error = str(e)
                             log.error(f"[{task_label}] Chunked compression failed: {run_error}")
                 else:
-                    cmd = _build_ffmpeg_args(local_input, output_path, req, encoder)
-                    returncode, stdout, stderr, run_error = await _run_process(
-                        cmd,
+                    returncode, stdout, stderr, run_error = await _encode_with_deadline(
+                        local_input,
+                        output_path,
+                        effective_req,
+                        encoder,
                         task_label,
-                        "single-pass compression",
+                        encode_timeout=encode_timeout,
+                        x265_zones=x265_zones,
+                        duration_seconds=duration_seconds,
+                        complexity=complexity,
+                        width=width,
+                        height=height,
+                        color=color_tags,
                     )
+
+                if returncode == 0 and os.path.exists(output_path):
+                    # Ratio push: if output still too large and budget remains, one CQ+ bump.
+                    # Competitive scores need ~8–18×; <4× rarely reaches top-5.
+                    try:
+                        src_sz = os.path.getsize(local_input)
+                        out_sz = os.path.getsize(output_path)
+                        ratio = (src_sz / out_sz) if out_sz > 0 else 0.0
+                        elapsed = time.monotonic() - request_t0
+                        left = encode_timeout - elapsed
+                        if (
+                            ratio > 0
+                            and ratio < 4.0
+                            and left >= 18.0
+                            and effective_req.codec_mode.upper() != "VBR"
+                        ):
+                            push_cq = min(55, int(effective_req.cq) + 4)
+                            push_req = effective_req.model_copy(update={"cq": push_cq})
+                            log.info(
+                                f"[{task_label}] ratio_push {ratio:.2f}x→cq {effective_req.cq}->{push_cq} "
+                                f"(left={left:.0f}s)"
+                            )
+                            _cleanup(output_path)
+                            rc2, so2, se2, err2 = await _encode_with_deadline(
+                                local_input,
+                                output_path,
+                                push_req,
+                                encoder,
+                                task_label,
+                                encode_timeout=left,
+                                duration_seconds=duration_seconds,
+                                complexity=complexity,
+                                width=width,
+                                height=height,
+                                color=color_tags,
+                            )
+                            if rc2 == 0 and os.path.exists(output_path):
+                                returncode, stdout, stderr, run_error = rc2, so2, se2, err2
+                                effective_req = push_req
+                                out_sz2 = os.path.getsize(output_path)
+                                ratio2 = (src_sz / out_sz2) if out_sz2 > 0 else 0.0
+                                log.info(f"[{task_label}] ratio_push result {ratio:.2f}x → {ratio2:.2f}x")
+                            else:
+                                log.warning(f"[{task_label}] ratio_push failed, keeping first encode")
+                    except Exception as exc:
+                        log.warning(f"[{task_label}] ratio_push skipped: {exc}")
+
+                    # Skip expensive integrity/calibration when time is tight.
+                    if encode_timeout > 8:
+                        try:
+                            ok, reason = await validate_output_matches_source(local_input, output_path)
+                            if not ok:
+                                log.warning(f"[{task_label}] integrity warning: {reason}")
+                        except Exception as exc:
+                            log.warning(f"[{task_label}] integrity skipped: {exc}")
+                    if predicted_vmaf and (time.monotonic() - request_t0) < encode_timeout:
+                        await _calibrate_sample_vs_output(
+                            local_input, output_path, predicted_vmaf, task_label
+                        )
 
         snapshot = await _queue_snapshot()
         stats = dict(active_tasks=snapshot["active_tasks"], queued_tasks=snapshot["queued_tasks"])

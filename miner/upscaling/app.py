@@ -23,6 +23,10 @@ from botocore.config import Config
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from length_reliability import get_recommended_length, record_upscale_runtime
+from integrity import validate_upscale_output
+from model_router import select_route
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -484,6 +488,7 @@ async def health():
         "video2x_allow_request_codec": VIDEO2X_ALLOW_REQUEST_CODEC,
         "video2x_common_encoder_args": VIDEO2X_COMMON_ENCODER_ARGS,
         "video2x_encoder_options": VIDEO2X_ENCODER_OPTIONS,
+        "recommended_content_length": get_recommended_length(),
         **snapshot,
         "storage": _storage_config_status(),
         "cleanup": _cleanup_config_status(),
@@ -508,6 +513,7 @@ async def _upscale_one(req: UpscaleRequest, input_video: str, task_label: str) -
     stdout = b""
     stderr = b""
     run_error = ""
+    upscale_t0 = time.monotonic()
 
     try:
         async with _queued_task(task_label) as (queue_position, snapshot):
@@ -536,6 +542,11 @@ async def _upscale_one(req: UpscaleRequest, input_video: str, task_label: str) -
             output_path = os.path.join(SHARED_VOLUME_PATH, output_filename)
             await _track_temp_files(output_path)
 
+            route = select_route(hint=req.model)
+            model_name = req.model or route.model_name
+            # Prefer high-quality encode; stay under validator size multipliers (8×/20×).
+            cq = min(req.cq, int(os.getenv("UPSCALE_OUTPUT_CQ", "28")))
+
             cmd = [
                 VIDEO2X_BIN,
                 "-i", local_input,
@@ -548,15 +559,17 @@ async def _upscale_one(req: UpscaleRequest, input_video: str, task_label: str) -
             cmd.extend(VIDEO2X_COMMON_ENCODER_ARGS)
             codec = req.codec if VIDEO2X_ALLOW_REQUEST_CODEC else VIDEO2X_CODEC
             cmd.extend([
-                "--realesrgan-model", req.model,
+                "--realesrgan-model", model_name,
                 "-c", codec,
             ])
             for option in VIDEO2X_ENCODER_OPTIONS:
-                cmd.extend(["-e", option.format(cq=req.cq)])
+                cmd.extend(["-e", option.format(cq=cq)])
 
+            upscale_t0 = time.monotonic()
             async with _running_task() as running_snapshot:
                 log.info(
                     f"[{task_label}] Starting {req.scale}x upscale "
+                    f"route={route.route.value} model={model_name} "
                     f"(active={running_snapshot['active_tasks']}/{MAX_CONCURRENT}, "
                     f"queued={running_snapshot['queued_tasks']})"
                 )
@@ -576,16 +589,20 @@ async def _upscale_one(req: UpscaleRequest, input_video: str, task_label: str) -
                     run_error = f"Failed to start Video2X: {e}"
                     log.error(f"[{task_label}] {run_error}")
 
+        wall = time.monotonic() - upscale_t0
+        content_len = 10
         snapshot = await _queue_snapshot()
         stats = dict(active_tasks=snapshot["active_tasks"], queued_tasks=snapshot["queued_tasks"])
 
         if proc is None:
+            record_upscale_runtime(content_len, wall or 1.0, success=False)
             _cleanup(output_path)
             if remote_mode:
                 _cleanup(local_input)
             return UpscaleResponse(success=False, errors=[run_error or "Video2X did not start"], **stats)
 
         if proc.returncode != 0:
+            record_upscale_runtime(content_len, wall or 1.0, success=False)
             err_msg = _format_process_output(stdout, stderr) or "Video2X failed without output"
             log.error(f"[{task_label}] video2x failed (rc={proc.returncode}): {err_msg}")
             _cleanup(output_path)
@@ -594,10 +611,20 @@ async def _upscale_one(req: UpscaleRequest, input_video: str, task_label: str) -
             return UpscaleResponse(success=False, errors=[err_msg], **stats)
 
         if not os.path.exists(output_path):
+            record_upscale_runtime(content_len, wall or 1.0, success=False)
             log.error(f"[{task_label}] Output file not found after video2x: {output_path}")
             if remote_mode:
                 _cleanup(local_input)
             return UpscaleResponse(success=False, errors=["Output file not created"], **stats)
+
+        try:
+            ok, reason = await validate_upscale_output(local_input, output_path, req.scale)
+            if not ok:
+                log.warning(f"[{task_label}] integrity warning: {reason}")
+        except Exception as exc:
+            log.warning(f"[{task_label}] integrity check failed: {exc}")
+
+        record_upscale_runtime(content_len, wall or 1.0, success=True)
 
         # --- Remote mode: upload result to S3, return URL ---
         if remote_mode:

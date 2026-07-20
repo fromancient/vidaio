@@ -29,7 +29,8 @@ class BaseMiner(ABC):
         logger.info(f"Subtensor: {self.subtensor}")
         self.wallet = bt.Wallet(config=self.config)
         logger.info(f"Wallet: {self.wallet}")
-        self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
+        netuid = int(self.config.netuid)
+        self.metagraph = self.subtensor.metagraph(netuid=netuid)
         logger.info(f"Metagraph: {self.metagraph}")
         self.axon = bt.Axon(config=self.config)
         self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
@@ -79,16 +80,22 @@ class BaseMiner(ABC):
         self.step = 0
     
     def get_config(self):
+        # Bittensor >=10.5 defaults BT_NO_PARSE_CLI_ARGS=true, which ignores
+        # --wallet.name / --netuid and leaves netuid=None (metagraph WASM trap).
+        os.environ["BT_NO_PARSE_CLI_ARGS"] = "false"
+
         parser = argparse.ArgumentParser()
         parser = add_common_config(parser)
         config = bt.Config(parser)
+        if getattr(config, "netuid", None) is None:
+            config.netuid = 85
         config.full_path = os.path.expanduser(
             "{}/{}/{}/netuid{}/{}".format(
                 config.logging.logging_dir,
                 config.wallet.name,
                 config.wallet.hotkey,
                 config.netuid,
-                "validator",
+                "miner",
             )
         )
         os.makedirs(config.full_path, exist_ok=True)
@@ -218,22 +225,24 @@ class BaseMiner(ABC):
         logger.info(f"Miner starting at block: {self.block}")
 
         # This loop maintains the miner's operations until intentionally stopped.
+        # IMPORTANT: always sleep — a tight sync loop starves the axon event loop
+        # and freezes validator payload downloads.
         try:
             while not self.should_exit:
-                while (
-                    self.block - self.metagraph.last_update[self.uid]
-                    < self.config.neuron.epoch_length
-                ):
-                    # Wait before checking again.
-                    time.sleep(1)
+                try:
+                    self.block = self.subtensor.get_current_block()
+                except Exception as e:
+                    logger.warning(f"Failed to refresh current block: {e}")
 
-                    # Check if we should exit.
-                    if self.should_exit:
-                        break
-
-                # Sync metagraph and potentially set weights.
                 self.sync()
                 self.step += 1
+
+                # Pace the background loop (~1 minute). Metagraph sync is disabled
+                # for miners (should_sync_metagraph=False); this is registration keepalive.
+                for _ in range(60):
+                    if self.should_exit:
+                        break
+                    time.sleep(1)
 
         # If someone intentionally stops the miner, it'll safely terminate operations.
         except KeyboardInterrupt:
