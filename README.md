@@ -445,6 +445,17 @@ The API will make Vidaio accessible to applications without requiring developers
 | **Transcoding**                | Conversion of video between codecs, formats, resolutions, or bitrates                      |
 | **Adaptive Bitrate Streaming** | Streaming approach that dynamically changes video quality according to available bandwidth |
 
+---
+
+## B. References
+
+### Video Quality & Processing
+
+* **VMAF** — [Video Multi-Method Assessment Fusion](https://github.com/vidaio-subnet/vmaf)
+* **Video2X** — [Video Upscaling Framework](https://github.com/vidaio-subnet/video2x)
+* **TOPIQ** — [Top-down Image Quality Assessment](https://arxiv.org/pdf/2308.03060v1)
+* **LPIPS** — [Learned Perceptual Image Patch Similarity](https://github.com/richzhang/PerceptualSimilarity)
+
 ## C. Contact
 
 Want to learn more, contribute, or follow Vidaio's development?
