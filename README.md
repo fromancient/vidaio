@@ -466,7 +466,9 @@ Developers will be able to:
 
 Want to learn more, contribute, or follow Vidaio's development?
 
-
+* **Website:** [vidaio.io](https://vidaio.io)
+* **X / Twitter:** [@vidaio_](https://x.com/vidaio_)
+* **GitHub:** Vidaio Subnet repositories and documentation
 
 ---
 
