@@ -455,6 +455,11 @@ The API will make Vidaio accessible to applications without requiring developers
 * **Video2X** — [Video Upscaling Framework](https://github.com/vidaio-subnet/video2x)
 * **TOPIQ** — [Top-down Image Quality Assessment](https://arxiv.org/pdf/2308.03060v1)
 * **LPIPS** — [Learned Perceptual Image Patch Similarity](https://github.com/richzhang/PerceptualSimilarity)
+
+### Bittensor
+
+* **Bittensor Documentation** — [docs.bittensor.com](https://docs.bittensor.com)
+
 ---
 
 ## C. Contact
