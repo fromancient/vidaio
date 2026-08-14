@@ -412,15 +412,6 @@ Planned API capabilities include:
 Upload → Configure → Process → Monitor → Retrieve
 ```
 
-Developers will be able to:
-
-* Upload videos.
-* Select processing operations.
-* Configure output quality.
-* Submit asynchronous processing jobs.
-* Monitor processing status.
-* Retrieve generated outputs.
-* Integrate decentralized video processing into external applications.
 
 The API will make Vidaio accessible to applications without requiring developers to directly interact with the underlying subnet infrastructure.
 
