@@ -1,10 +1,13 @@
 import re
 import os
 import codecs
+
 from os import path
 from io import open
 from setuptools import setup, find_packages
 from setuptools import setup, find_packages
+=======
+
 
 def read_requirements(path):
     with open(path, "r") as f:
