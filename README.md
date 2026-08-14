@@ -422,7 +422,7 @@ Developers will be able to:
 * Retrieve generated outputs.
 * Integrate decentralized video processing into external applications.
 
-
+The API will make Vidaio accessible to applications without requiring developers to directly interact with the underlying subnet infrastructure.
 
 ---
 
@@ -479,7 +479,5 @@ Want to learn more, contribute, or follow Vidaio's development?
 **[Website](https://vidaio.io) • [X](https://x.com/vidaio_) • [Miner Setup](docs/miner_setup.md) • [Validator Setup](docs/validator_setup.md)**
 
 <br>
-
-MIT Licensed
 
 </div>
