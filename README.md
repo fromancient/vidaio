@@ -462,7 +462,6 @@ Developers will be able to:
 
 ---
 
-## C. Contact
 
 Want to learn more, contribute, or follow Vidaio's development?
 
