@@ -12,7 +12,7 @@ To achieve optimal results, we recommend the following setup:
 
 ---
 
-## Bootstrap System Dependencies
+## Bootstrap System Dependencies -is
 
 The `bootstrap.sh` script at the repository root automates the installation of core system-level dependencies:
 
