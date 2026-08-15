@@ -2,7 +2,7 @@
 
 ---
 
-## Machine Requirements
+## Machine Requirements - this is error i think.
 
 To achieve optimal results, we recommend the following setup:
 
