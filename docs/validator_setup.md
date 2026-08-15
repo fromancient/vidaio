@@ -12,7 +12,7 @@ To achieve optimal results, we recommend the following setup:
 
 ---
 
-## Bootstrap System Dependencies -is
+## Bootstrap System Dependencies
 
 The `bootstrap.sh` script at the repository root automates the installation of core system-level dependencies:
 
@@ -21,7 +21,7 @@ The `bootstrap.sh` script at the repository root automates the installation of c
 - **Python 3.11**
 - Base utilities (git, curl, wget, etc.)
 
-Run the script **as root** with the `-E` flag to preserve environment variables:
+Run the script **as root** with the `-E` flag to preserve environment variables: -c
 
 ```bash
 sudo -E ./bootstrap.sh
