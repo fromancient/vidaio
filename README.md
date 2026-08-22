@@ -51,10 +51,7 @@ Vidaio enables creators, developers, businesses, and platforms to process video 
 
 The subnet initially focuses on two core workloads:
 
-* **AI Video Upscaling** — enhance resolution and perceived visual quality.
-* **Intelligent Video Compression** — reduce file size and bandwidth requirements while preserving visual quality.
 
-Over time, Vidaio aims to evolve into a broader decentralized video infrastructure layer supporting **transcoding, adaptive bitrate optimization, on-demand streaming, live streaming, and API-driven video processing**.
 
 ---
 
