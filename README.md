@@ -116,9 +116,7 @@ Validators distribute workloads, evaluate miner responses, calculate performance
 
 Miners are the execution layer of the Vidaio network.
 
-They process video workloads submitted by validators and continuously compete on **quality, efficiency, and processing performance**.
 
-Miners can:
 
 * Optimize existing open-source video-processing models.
 * Develop proprietary AI models and processing pipelines.
