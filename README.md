@@ -58,9 +58,6 @@ Over time, Vidaio aims to evolve into a broader decentralized video infrastructu
 
 ---
 
-# 2. Subnet Architecture
-
-## 2.1 Overview
 
 Vidaio follows Bittensor's decentralized miner-validator architecture.
 
